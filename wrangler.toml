@@ -1,0 +1,13 @@
+name = "qq-bot-cloudflare"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+[vars]
+# 在 Cloudflare Dashboard 中配置这些环境变量
+# QQBOT_APP_ID = "your_app_id"
+# QQBOT_CLIENT_SECRET = "your_client_secret"
+
+# KV 命名空间配置（可选，用于 Token 缓存和消息去重）
+# [[kv_namespaces]]
+# binding = "QQ_BOT_KV"
+# id = "your_kv_namespace_id"
