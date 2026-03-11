@@ -4,11 +4,8 @@
  * QQ Bot API 上传文件后返回 file_info + ttl，在 TTL 内相同文件可直接复用 file_info
  * 避免重复上传同一文件，节省带宽和时间。
  *
- * 缓存 key = md5(fileContent) + targetType(c2c/group) + targetId + fileType
+ * 缓存 key = hash(fileContent) + targetType(c2c/group) + targetId + fileType
  */
-
-import * as crypto from "node:crypto";
-import * as fs from "node:fs";
 
 interface CacheEntry {
   fileInfo: string;
@@ -23,13 +20,18 @@ const cache = new Map<string, CacheEntry>();
 // 最大缓存条目数，防止内存泄漏
 const MAX_CACHE_SIZE = 500;
 
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 /**
- * 计算文件内容的 MD5 hash（用于缓存 key）
- * 对于 Base64 数据直接 hash，对于文件路径读取后 hash
+ * 计算文件内容 hash（用于缓存 key）
+ * 使用 Web Crypto，兼容 Cloudflare Workers 和现代 Node.js。
  */
-export function computeFileHash(data: string | Buffer): string {
-  const content = typeof data === "string" ? data : data;
-  return crypto.createHash("md5").update(content).digest("hex");
+export async function computeFileHash(data: string): Promise<string> {
+  const encoded = new TextEncoder().encode(data);
+  const digest = await crypto.subtle.digest("SHA-256", encoded);
+  return bytesToHex(new Uint8Array(digest));
 }
 
 /**

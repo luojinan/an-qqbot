@@ -1,6 +1,11 @@
 import { Hono } from 'hono';
 import qqRoutes from './routes';
-import { initApiConfig } from './lib/api';
+import {
+  getAccessToken,
+  initApiConfig,
+  sendC2CMessage,
+  sendGroupMessage,
+} from './lib/api';
 import { connectToGateway, getConnectionState } from './gateway';
 
 // 定义环境变量类型
@@ -28,7 +33,11 @@ app.get('/', (c) => {
 app.get('/status', (c) => {
   const state = getConnectionState();
   return c.json({
-    websocket: state.isConnected ? 'connected' : 'disconnected',
+    websocket: state.isConnected
+      ? 'connected'
+      : state.isConnecting
+        ? 'connecting'
+        : 'disconnected',
     sessionId: state.sessionId,
     lastHeartbeat: state.lastHeartbeatAck,
     uptime: Date.now()
@@ -46,11 +55,43 @@ app.post('/connect', async (c) => {
 
   try {
     // 连接到网关，并处理接收到的消息
-    await connectToGateway(appId, clientSecret, (event) => {
+    await connectToGateway(appId, clientSecret, async (event) => {
       console.log('[Message Event]', event.type, event.data);
 
-      // TODO: 在这里处理接收到的消息
-      // 例如：自动回复、调用业务逻辑等
+      try {
+        const token = await getAccessToken(appId, clientSecret);
+
+        if (event.type === 'C2C_MESSAGE_CREATE') {
+          const openid = event.data?.author?.user_openid;
+          const msgId = event.data?.id;
+          const content = String(event.data?.content ?? '').trim() || '空消息';
+
+          if (!openid || !msgId) {
+            console.warn('[Auto Reply] Missing c2c openid or msgId');
+            return;
+          }
+
+          await sendC2CMessage(token, openid, `收到你的消息：${content}`, msgId);
+          console.log('[Auto Reply] C2C reply sent to:', openid);
+          return;
+        }
+
+        if (event.type === 'GROUP_AT_MESSAGE_CREATE') {
+          const groupOpenid = event.data?.group_openid;
+          const msgId = event.data?.id;
+          const content = String(event.data?.content ?? '').trim() || '空消息';
+
+          if (!groupOpenid || !msgId) {
+            console.warn('[Auto Reply] Missing groupOpenid or msgId');
+            return;
+          }
+
+          await sendGroupMessage(token, groupOpenid, `收到群消息：${content}`, msgId);
+          console.log('[Auto Reply] Group reply sent to:', groupOpenid);
+        }
+      } catch (error) {
+        console.error('[Auto Reply] Failed to handle event:', error);
+      }
     });
 
     return c.json({ status: 'connecting', message: 'WebSocket connection initiated' });

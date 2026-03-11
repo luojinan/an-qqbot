@@ -61,9 +61,9 @@ qqRoutes.post('/reply', async (c) => {
 
   let result;
   if (type === 'c2c') {
-    result = await sendC2CMessage(token, to, { content: text, msg_type: 0, msg_id: msgId });
+    result = await sendC2CMessage(token, to, text, msgId);
   } else if (type === 'group') {
-    result = await sendGroupMessage(token, to, { content: text, msg_type: 0, msg_id: msgId });
+    result = await sendGroupMessage(token, to, text, msgId);
   } else {
     return c.json({ error: 'Invalid type, must be "c2c" or "group"' }, 400);
   }

@@ -5,14 +5,18 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "tail": "wrangler tail"
+    "tail": "wrangler tail",
+    "typecheck": "tsc --noEmit",
+    "test:send": "node scripts/test-send-proactive-message.mjs",
+    "test:send:group": "node scripts/test-send-proactive-group-message.mjs"
   },
   "dependencies": {
     "hono": "^4.0.0"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20240208.0",
-    "wrangler": "^3.28.0",
-    "typescript": "^5.3.3"
+    "@cloudflare/workers-types": "^4.20260310.1",
+    "@types/node": "^24.5.2",
+    "typescript": "^5.3.3",
+    "wrangler": "^4.72.0"
   }
 }

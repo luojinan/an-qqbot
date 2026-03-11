@@ -8,7 +8,7 @@ import {
   getCachedFileInfo,
   setCachedFileInfo,
 } from "./utils/upload-cache.js";
-import { sanitizeFileName } from "./utils/platform.js";
+import { sanitizeFileName } from "./utils/filename.js";
 
 const API_BASE = "https://api.sgroup.qq.com";
 const TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken";
@@ -501,7 +501,7 @@ export async function uploadC2CMedia(
     throw new Error("uploadC2CMedia: url or fileData is required");
 
   if (fileData) {
-    const contentHash = computeFileHash(fileData);
+    const contentHash = await computeFileHash(fileData);
     const cachedInfo = getCachedFileInfo(contentHash, "c2c", openid, fileType);
     if (cachedInfo) {
       return { file_uuid: "", file_info: cachedInfo, ttl: 0 };
@@ -525,7 +525,7 @@ export async function uploadC2CMedia(
   );
 
   if (fileData && result.file_info && result.ttl > 0) {
-    const contentHash = computeFileHash(fileData);
+    const contentHash = await computeFileHash(fileData);
     setCachedFileInfo(
       contentHash,
       "c2c",
@@ -552,7 +552,7 @@ export async function uploadGroupMedia(
     throw new Error("uploadGroupMedia: url or fileData is required");
 
   if (fileData) {
-    const contentHash = computeFileHash(fileData);
+    const contentHash = await computeFileHash(fileData);
     const cachedInfo = getCachedFileInfo(
       contentHash,
       "group",
@@ -581,7 +581,7 @@ export async function uploadGroupMedia(
   );
 
   if (fileData && result.file_info && result.ttl > 0) {
-    const contentHash = computeFileHash(fileData);
+    const contentHash = await computeFileHash(fileData);
     setCachedFileInfo(
       contentHash,
       "group",

@@ -4,7 +4,7 @@
     "module": "ESNext",
     "lib": ["ES2020", "DOM", "WebWorker"],
     "moduleResolution": "bundler",
-    "types": ["@cloudflare/workers-types"],
+    "types": ["@cloudflare/workers-types", "node"],
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,

@@ -34,6 +34,7 @@ interface ConnectionState {
   heartbeatInterval: number | null;
   heartbeatTimer: any;
   isConnected: boolean;
+  isConnecting: boolean;
   lastHeartbeatAck: number;
 }
 
@@ -45,8 +46,28 @@ let globalConnection: ConnectionState = {
   heartbeatInterval: null,
   heartbeatTimer: null,
   isConnected: false,
+  isConnecting: false,
   lastHeartbeatAck: Date.now(),
 };
+
+let connectPromise: Promise<ConnectionState> | null = null;
+
+function resetConnectionState() {
+  if (globalConnection.heartbeatTimer) {
+    clearInterval(globalConnection.heartbeatTimer);
+  }
+
+  globalConnection = {
+    ws: null,
+    sessionId: null,
+    seq: null,
+    heartbeatInterval: null,
+    heartbeatTimer: null,
+    isConnected: false,
+    isConnecting: false,
+    lastHeartbeatAck: Date.now(),
+  };
+}
 
 /**
  * 获取网关地址
@@ -78,6 +99,39 @@ function sendHeartbeat(ws: WebSocket, seq: number | null) {
 
   console.log('[QQ Gateway] Sending heartbeat, seq:', seq);
   ws.send(JSON.stringify(payload));
+}
+
+async function waitForGatewaySocketOpen(ws: WebSocket): Promise<void> {
+  return await new Promise((resolve, reject) => {
+    const cleanup = () => {
+      ws.removeEventListener('open', handleOpen);
+      ws.removeEventListener('error', handleError);
+      ws.removeEventListener('close', handleClose);
+    };
+
+    const handleOpen = () => {
+      cleanup();
+      resolve();
+    };
+
+    const handleError = (event: Event) => {
+      cleanup();
+      reject(new Error(`[QQ Gateway] WebSocket open failed: ${event.type}`));
+    };
+
+    const handleClose = (event: CloseEvent) => {
+      cleanup();
+      reject(
+        new Error(
+          `[QQ Gateway] WebSocket closed before ready: ${event.code} ${event.reason}`,
+        ),
+      );
+    };
+
+    ws.addEventListener('open', handleOpen);
+    ws.addEventListener('error', handleError);
+    ws.addEventListener('close', handleClose);
+  });
 }
 
 /**
@@ -128,7 +182,7 @@ function handleGatewayMessage(
       }
 
       state.heartbeatTimer = setInterval(() => {
-        if (state.ws && state.isConnected) {
+        if (state.ws && state.ws.readyState === 1) {
           sendHeartbeat(state.ws, state.seq);
         }
       }, hello.heartbeat_interval);
@@ -146,14 +200,19 @@ function handleGatewayMessage(
         const ready = payload.d as GatewayReady;
         state.sessionId = ready.session_id;
         state.isConnected = true;
+        state.isConnecting = false;
         console.log('[QQ Gateway] Connected! Session ID:', ready.session_id);
       }
 
       // 调用消息处理回调
       if (onMessage && payload.d) {
-        onMessage({
-          type: payload.t,
-          data: payload.d,
+        Promise.resolve(
+          onMessage({
+            type: payload.t,
+            data: payload.d,
+          }),
+        ).catch((error) => {
+          console.error('[QQ Gateway] Error in onMessage callback:', error);
         });
       }
       break;
@@ -183,67 +242,54 @@ export async function connectToGateway(
     return globalConnection;
   }
 
-  try {
-    // 获取 Token
-    const token = await getAccessToken(appId, clientSecret);
-
-    // 获取网关地址
-    const gatewayUrl = await getGatewayUrl(token);
-    console.log('[QQ Gateway] Connecting to:', gatewayUrl);
-
-    // 使用 fetch + Upgrade 建立 WebSocket 连接
-    const response = await fetch(gatewayUrl, {
-      headers: {
-        Upgrade: 'websocket',
-      },
-    });
-
-    const ws = response.webSocket;
-    if (!ws) {
-      throw new Error('Failed to establish WebSocket connection');
-    }
-
-    // 接受连接
-    ws.accept();
-
-    // 更新全局状态
-    globalConnection.ws = ws;
-    globalConnection.isConnected = false; // 等待 READY 事件
-
-    // 监听消息
-    ws.addEventListener('message', (event) => {
-      try {
-        handleGatewayMessage(event.data as string, globalConnection, token, onMessage);
-      } catch (error) {
-        console.error('[QQ Gateway] Error handling message:', error);
-      }
-    });
-
-    // 监听关闭
-    ws.addEventListener('close', (event) => {
-      console.log('[QQ Gateway] Connection closed:', event.code, event.reason);
-
-      // 清理状态
-      if (globalConnection.heartbeatTimer) {
-        clearInterval(globalConnection.heartbeatTimer);
-      }
-
-      globalConnection.ws = null;
-      globalConnection.isConnected = false;
-    });
-
-    // 监听错误
-    ws.addEventListener('error', (event) => {
-      console.error('[QQ Gateway] WebSocket error:', event);
-    });
-
-    console.log('[QQ Gateway] WebSocket connection established');
-    return globalConnection;
-
-  } catch (error) {
-    console.error('[QQ Gateway] Failed to connect:', error);
-    throw error;
+  if (connectPromise) {
+    console.log('[QQ Gateway] Connection already in progress');
+    return await connectPromise;
   }
+
+  globalConnection.isConnecting = true;
+  connectPromise = (async () => {
+    try {
+      const token = await getAccessToken(appId, clientSecret);
+      const gatewayUrl = await getGatewayUrl(token);
+      console.log('[QQ Gateway] Connecting to:', gatewayUrl);
+
+      const ws = new WebSocket(gatewayUrl);
+
+      globalConnection.ws = ws;
+      globalConnection.isConnected = false;
+      globalConnection.isConnecting = true;
+
+      ws.addEventListener('message', (event) => {
+        try {
+          handleGatewayMessage(event.data as string, globalConnection, token, onMessage);
+        } catch (error) {
+          console.error('[QQ Gateway] Error handling message:', error);
+        }
+      });
+
+      ws.addEventListener('close', (event) => {
+        console.log('[QQ Gateway] Connection closed:', event.code, event.reason);
+        connectPromise = null;
+        resetConnectionState();
+      });
+
+      ws.addEventListener('error', (event) => {
+        console.error('[QQ Gateway] WebSocket error:', event);
+      });
+
+      await waitForGatewaySocketOpen(ws);
+      console.log('[QQ Gateway] WebSocket connection established');
+      return globalConnection;
+    } catch (error) {
+      connectPromise = null;
+      resetConnectionState();
+      console.error('[QQ Gateway] Failed to connect:', error);
+      throw error;
+    }
+  })();
+
+  return await connectPromise;
 }
 
 /**
@@ -257,21 +303,10 @@ export function getConnectionState(): ConnectionState {
  * 断开连接
  */
 export function disconnect() {
-  if (globalConnection.heartbeatTimer) {
-    clearInterval(globalConnection.heartbeatTimer);
-  }
-
   if (globalConnection.ws) {
     globalConnection.ws.close();
   }
 
-  globalConnection = {
-    ws: null,
-    sessionId: null,
-    seq: null,
-    heartbeatInterval: null,
-    heartbeatTimer: null,
-    isConnected: false,
-    lastHeartbeatAck: Date.now(),
-  };
+  connectPromise = null;
+  resetConnectionState();
 }

@@ -197,8 +197,8 @@ export function looksLikeLocalPath(p: string): boolean {
 
 // ============ ffmpeg 跨平台检测 ============
 
-let _ffmpegPath: string | null | undefined; // undefined = 未检测, null = 不可用
-let _ffmpegCheckPromise: Promise<string | null> | null = null;
+let ffmpegPathCache: string | null | undefined;
+let ffmpegCheckPromise: Promise<string | null> | null = null;
 
 /**
  * 检测 ffmpeg 是否可用，返回可执行路径
@@ -209,29 +209,28 @@ let _ffmpegCheckPromise: Promise<string | null> | null = null;
  * @returns ffmpeg 可执行文件路径，不可用返回 null
  */
 export function detectFfmpeg(): Promise<string | null> {
-  if (_ffmpegPath !== undefined) return Promise.resolve(_ffmpegPath);
-  if (_ffmpegCheckPromise) return _ffmpegCheckPromise;
+  if (ffmpegPathCache !== undefined) return Promise.resolve(ffmpegPathCache);
+  if (ffmpegCheckPromise) return ffmpegCheckPromise;
 
-  _ffmpegCheckPromise = (async () => {
-    // 1. 环境变量自定义路径
+  const pending = (async (): Promise<string | null> => {
     const envPath = process.env.FFMPEG_PATH;
     if (envPath) {
       const ok = await testExecutable(envPath, ["-version"]);
       if (ok) {
-        _ffmpegPath = envPath;
+        ffmpegPathCache = envPath;
         console.log(`[platform] ffmpeg found via FFMPEG_PATH: ${envPath}`);
-        return _ffmpegPath;
+        return envPath;
       }
       console.warn(`[platform] FFMPEG_PATH set but not working: ${envPath}`);
     }
 
     // 2. 系统 PATH 中检测
-    const cmd = isWindows() ? "ffmpeg.exe" : "ffmpeg";
-    const ok = await testExecutable(cmd, ["-version"]);
-    if (ok) {
-      _ffmpegPath = cmd;
-      console.log(`[platform] ffmpeg detected in PATH`);
-      return _ffmpegPath;
+    const command = isWindows() ? "ffmpeg.exe" : "ffmpeg";
+    const commandWorks = await testExecutable(command, ["-version"]);
+    if (commandWorks) {
+      ffmpegPathCache = command;
+      console.log("[platform] ffmpeg detected in PATH");
+      return command;
     }
 
     // 3. 常见安装位置（Mac brew、Windows choco/scoop）
@@ -259,24 +258,26 @@ export function detectFfmpeg(): Promise<string | null> {
           "/snap/bin/ffmpeg", // Linux snap
         ];
 
-    for (const p of commonPaths) {
-      if (p && fs.existsSync(p)) {
-        const works = await testExecutable(p, ["-version"]);
+    for (const candidatePath of commonPaths) {
+      if (candidatePath && fs.existsSync(candidatePath)) {
+        const works = await testExecutable(candidatePath, ["-version"]);
         if (works) {
-          _ffmpegPath = p;
-          console.log(`[platform] ffmpeg found at: ${p}`);
-          return _ffmpegPath;
+          ffmpegPathCache = candidatePath;
+          console.log(`[platform] ffmpeg found at: ${candidatePath}`);
+          return candidatePath;
         }
       }
     }
 
-    _ffmpegPath = null;
+    ffmpegPathCache = null;
     return null;
-  })().finally(() => {
-    _ffmpegCheckPromise = null;
+  })();
+
+  ffmpegCheckPromise = pending.finally(() => {
+    ffmpegCheckPromise = null;
   });
 
-  return _ffmpegCheckPromise;
+  return ffmpegCheckPromise;
 }
 
 /** 测试可执行文件是否能正常运行 */
@@ -290,13 +291,13 @@ function testExecutable(cmd: string, args: string[]): Promise<boolean> {
 
 /** 重置 ffmpeg 缓存（用于测试） */
 export function resetFfmpegCache(): void {
-  _ffmpegPath = undefined;
-  _ffmpegCheckPromise = null;
+  ffmpegPathCache = undefined;
+  ffmpegCheckPromise = null;
 }
 
 // ============ silk-wasm 兼容性 ============
 
-let _silkWasmAvailable: boolean | null = null;
+let silkWasmAvailableCache: boolean | null = null;
 
 /**
  * 检测 silk-wasm 是否可用
@@ -305,21 +306,21 @@ let _silkWasmAvailable: boolean | null = null;
  * 提前检测避免运行时崩溃。
  */
 export async function checkSilkWasmAvailable(): Promise<boolean> {
-  if (_silkWasmAvailable !== null) return _silkWasmAvailable;
+  if (silkWasmAvailableCache !== null) return silkWasmAvailableCache;
 
   try {
     const { isSilk } = await import("silk-wasm");
     // 用一个空 buffer 快速测试 WASM 是否能加载
     isSilk(new Uint8Array(0));
-    _silkWasmAvailable = true;
+    silkWasmAvailableCache = true;
     console.log("[platform] silk-wasm: available");
   } catch (err) {
-    _silkWasmAvailable = false;
+    silkWasmAvailableCache = false;
     console.warn(
       `[platform] silk-wasm: NOT available (${err instanceof Error ? err.message : String(err)})`,
     );
   }
-  return _silkWasmAvailable;
+  return silkWasmAvailableCache;
 }
 
 // ============ 启动环境诊断 ============
@@ -351,8 +352,8 @@ export async function runDiagnostics(): Promise<DiagnosticReport> {
   const dataDir = getQQBotDataDir();
 
   // 检测 ffmpeg
-  const ffmpegPath = await detectFfmpeg();
-  if (!ffmpegPath) {
+  const ffmpeg = await detectFfmpeg();
+  if (!ffmpeg) {
     warnings.push(
       isWindows()
         ? "⚠️ ffmpeg 未安装。语音/视频格式转换将受限。安装方式: choco install ffmpeg 或 scoop install ffmpeg 或从 https://ffmpeg.org 下载"
@@ -396,7 +397,7 @@ export async function runDiagnostics(): Promise<DiagnosticReport> {
     homeDir,
     tempDir,
     dataDir,
-    ffmpeg: ffmpegPath,
+    ffmpeg,
     silkWasm,
     warnings,
   };
@@ -407,7 +408,7 @@ export async function runDiagnostics(): Promise<DiagnosticReport> {
   console.log(`  Node: ${nodeVersion}`);
   console.log(`  主目录: ${homeDir}`);
   console.log(`  数据目录: ${dataDir}`);
-  console.log(`  ffmpeg: ${ffmpegPath ?? "未安装"}`);
+  console.log(`  ffmpeg: ${ffmpeg ?? "未安装"}`);
   console.log(`  silk-wasm: ${silkWasm ? "可用" : "不可用"}`);
   if (warnings.length > 0) {
     console.log("  --- 警告 ---");
