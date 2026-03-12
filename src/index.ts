@@ -18,7 +18,7 @@ type Bindings = {
 const app = new Hono<{ Bindings: Bindings }>();
 
 // 初始化 API 配置
-initApiConfig({ markdownSupport: false });
+initApiConfig({ markdownSupport: true });
 
 // 健康检查
 app.get('/', (c) => {
@@ -27,7 +27,7 @@ app.get('/', (c) => {
     message: 'QQ Bot API is running',
     timestamp: new Date().toISOString()
   });
-});
+})
 
 // 连接状态查询
 app.get('/status', (c) => {
@@ -42,7 +42,7 @@ app.get('/status', (c) => {
     lastHeartbeat: state.lastHeartbeatAck,
     uptime: Date.now()
   });
-});
+})
 
 // 启动 WebSocket 连接
 app.post('/connect', async (c) => {
