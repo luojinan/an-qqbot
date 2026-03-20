@@ -38,6 +38,21 @@ interface ConnectionState {
   lastHeartbeatAck: number;
 }
 
+// 重连常量
+const RECONNECT_BASE_DELAY_MS = 1000;
+const RECONNECT_MAX_DELAY_MS = 60000;
+const HEARTBEAT_TIMEOUT_MS = 15000;
+
+// 不可恢复的关闭码，收到这些码不重连
+const NON_RECOVERABLE_CLOSE_CODES = new Set([
+  4004, // 认证失败
+  4010, // Shard 无效
+  4011, // Sharding required
+  4012, // Invalid API version
+  4013, // Invalid intents
+  4014, // Disallowed intents
+]);
+
 // 全局连接状态（同一 Worker 实例内复用）
 let globalConnection: ConnectionState = {
   ws: null,
@@ -52,15 +67,24 @@ let globalConnection: ConnectionState = {
 
 let connectPromise: Promise<ConnectionState> | null = null;
 
-function resetConnectionState() {
+// 保存凭据和回调，用于自动重连
+let savedCredentials: { appId: string; clientSecret: string } | null = null;
+let savedOnMessage: ((event: any) => void) | null = null;
+let reconnectAttempt = 0;
+let reconnectTimer: any = null;
+
+function resetConnectionState(preserveSession = false) {
   if (globalConnection.heartbeatTimer) {
     clearInterval(globalConnection.heartbeatTimer);
   }
 
+  const sessionId = preserveSession ? globalConnection.sessionId : null;
+  const seq = preserveSession ? globalConnection.seq : null;
+
   globalConnection = {
     ws: null,
-    sessionId: null,
-    seq: null,
+    sessionId,
+    seq,
     heartbeatInterval: null,
     heartbeatTimer: null,
     isConnected: false,
@@ -152,6 +176,23 @@ function sendIdentify(ws: WebSocket, token: string) {
 }
 
 /**
+ * 发送 Resume 恢复会话
+ */
+function sendResume(ws: WebSocket, token: string, sessionId: string, seq: number) {
+  const payload: GatewayPayload = {
+    op: 6,
+    d: {
+      token: `QQBot ${token}`,
+      session_id: sessionId,
+      seq,
+    },
+  };
+
+  console.log('[QQ Gateway] Sending resume, session:', sessionId, 'seq:', seq);
+  ws.send(JSON.stringify(payload));
+}
+
+/**
  * 处理网关消息
  */
 function handleGatewayMessage(
@@ -172,17 +213,29 @@ function handleGatewayMessage(
       const hello = payload.d as GatewayHello;
       console.log('[QQ Gateway] Received Hello, heartbeat_interval:', hello.heartbeat_interval);
 
-      // 发送鉴权
-      sendIdentify(state.ws!, token);
+      // 根据是否有 session 信息决定 Resume 还是 Identify
+      if (state.sessionId && state.seq !== null) {
+        sendResume(state.ws!, token, state.sessionId, state.seq);
+      } else {
+        sendIdentify(state.ws!, token);
+      }
 
       // 启动心跳
       state.heartbeatInterval = hello.heartbeat_interval;
       if (state.heartbeatTimer) {
         clearInterval(state.heartbeatTimer);
       }
+      state.lastHeartbeatAck = Date.now();
 
       state.heartbeatTimer = setInterval(() => {
         if (state.ws && state.ws.readyState === 1) {
+          // 心跳超时检测：距上次 ACK 超过 heartbeatInterval + HEARTBEAT_TIMEOUT_MS
+          const timeSinceAck = Date.now() - state.lastHeartbeatAck;
+          if (timeSinceAck > hello.heartbeat_interval + HEARTBEAT_TIMEOUT_MS) {
+            console.warn('[QQ Gateway] Heartbeat ACK timeout, closing connection to trigger reconnect');
+            state.ws.close(4000, 'Heartbeat timeout');
+            return;
+          }
           sendHeartbeat(state.ws, state.seq);
         }
       }, hello.heartbeat_interval);
@@ -201,7 +254,15 @@ function handleGatewayMessage(
         state.sessionId = ready.session_id;
         state.isConnected = true;
         state.isConnecting = false;
+        reconnectAttempt = 0;
         console.log('[QQ Gateway] Connected! Session ID:', ready.session_id);
+      }
+
+      if (payload.t === 'RESUMED') {
+        state.isConnected = true;
+        state.isConnecting = false;
+        reconnectAttempt = 0;
+        console.log('[QQ Gateway] Session resumed successfully');
       }
 
       // 调用消息处理回调
@@ -218,14 +279,111 @@ function handleGatewayMessage(
       break;
 
     case 9: // Invalid Session
-      console.error('[QQ Gateway] Invalid session, reconnecting...');
+      console.error('[QQ Gateway] Invalid session, will do fresh identify on reconnect');
       state.sessionId = null;
       state.seq = null;
+      // 关闭当前连接，触发 close → 重连（此次会走 Identify）
+      if (state.ws) {
+        state.ws.close(4009, 'Invalid session');
+      }
       break;
 
     default:
       console.log('[QQ Gateway] Unknown opcode:', payload.op);
   }
+}
+
+/**
+ * 计算重连延迟（指数退避）
+ */
+function getReconnectDelay(): number {
+  const delay = Math.min(
+    RECONNECT_BASE_DELAY_MS * Math.pow(2, reconnectAttempt),
+    RECONNECT_MAX_DELAY_MS,
+  );
+  return delay;
+}
+
+/**
+ * 调度自动重连
+ */
+function scheduleReconnect() {
+  if (!savedCredentials) {
+    console.error('[QQ Gateway] No saved credentials, cannot reconnect');
+    return;
+  }
+
+  const delay = getReconnectDelay();
+  console.log(`[QQ Gateway] Scheduling reconnect in ${delay}ms (attempt ${reconnectAttempt + 1})`);
+
+  reconnectTimer = setTimeout(async () => {
+    reconnectTimer = null;
+    try {
+      await doConnect();
+    } catch (error) {
+      console.error('[QQ Gateway] Reconnect failed:', error);
+      reconnectAttempt++;
+      scheduleReconnect();
+    }
+  }, delay);
+}
+
+/**
+ * 实际建立 WebSocket 连接的内部函数
+ */
+async function doConnect(): Promise<ConnectionState> {
+  if (!savedCredentials) {
+    throw new Error('No saved credentials');
+  }
+
+  const { appId, clientSecret } = savedCredentials;
+  const onMessage = savedOnMessage ?? undefined;
+
+  globalConnection.isConnecting = true;
+
+  const token = await getAccessToken(appId, clientSecret);
+  const gatewayUrl = await getGatewayUrl(token);
+  console.log('[QQ Gateway] Connecting to:', gatewayUrl);
+
+  const ws = new WebSocket(gatewayUrl);
+
+  globalConnection.ws = ws;
+  globalConnection.isConnected = false;
+  globalConnection.isConnecting = true;
+
+  ws.addEventListener('message', (event) => {
+    try {
+      handleGatewayMessage(event.data as string, globalConnection, token, onMessage);
+    } catch (error) {
+      console.error('[QQ Gateway] Error handling message:', error);
+    }
+  });
+
+  ws.addEventListener('close', (event) => {
+    console.log('[QQ Gateway] Connection closed:', event.code, event.reason);
+    connectPromise = null;
+
+    // 不可恢复的关闭码 — 不重连
+    if (NON_RECOVERABLE_CLOSE_CODES.has(event.code)) {
+      console.error(`[QQ Gateway] Non-recoverable close code ${event.code}, will not reconnect`);
+      resetConnectionState();
+      return;
+    }
+
+    // 保留 sessionId + seq 用于 Resume，清理其余状态
+    resetConnectionState(true);
+
+    // 触发自动重连
+    scheduleReconnect();
+  });
+
+  ws.addEventListener('error', (event) => {
+    console.error('[QQ Gateway] WebSocket error:', event);
+  });
+
+  await waitForGatewaySocketOpen(ws);
+  console.log('[QQ Gateway] WebSocket connection established');
+  return globalConnection;
 }
 
 /**
@@ -236,6 +394,12 @@ export async function connectToGateway(
   clientSecret: string,
   onMessage?: (event: any) => void
 ): Promise<ConnectionState> {
+  // 保存凭据和回调，用于自动重连
+  savedCredentials = { appId, clientSecret };
+  if (onMessage) {
+    savedOnMessage = onMessage;
+  }
+
   // 如果已有活跃连接，直接返回
   if (globalConnection.ws && globalConnection.isConnected) {
     console.log('[QQ Gateway] Reusing existing connection');
@@ -247,47 +411,14 @@ export async function connectToGateway(
     return await connectPromise;
   }
 
-  globalConnection.isConnecting = true;
-  connectPromise = (async () => {
-    try {
-      const token = await getAccessToken(appId, clientSecret);
-      const gatewayUrl = await getGatewayUrl(token);
-      console.log('[QQ Gateway] Connecting to:', gatewayUrl);
+  reconnectAttempt = 0;
 
-      const ws = new WebSocket(gatewayUrl);
-
-      globalConnection.ws = ws;
-      globalConnection.isConnected = false;
-      globalConnection.isConnecting = true;
-
-      ws.addEventListener('message', (event) => {
-        try {
-          handleGatewayMessage(event.data as string, globalConnection, token, onMessage);
-        } catch (error) {
-          console.error('[QQ Gateway] Error handling message:', error);
-        }
-      });
-
-      ws.addEventListener('close', (event) => {
-        console.log('[QQ Gateway] Connection closed:', event.code, event.reason);
-        connectPromise = null;
-        resetConnectionState();
-      });
-
-      ws.addEventListener('error', (event) => {
-        console.error('[QQ Gateway] WebSocket error:', event);
-      });
-
-      await waitForGatewaySocketOpen(ws);
-      console.log('[QQ Gateway] WebSocket connection established');
-      return globalConnection;
-    } catch (error) {
-      connectPromise = null;
-      resetConnectionState();
-      console.error('[QQ Gateway] Failed to connect:', error);
-      throw error;
-    }
-  })();
+  connectPromise = doConnect().catch((error) => {
+    connectPromise = null;
+    resetConnectionState();
+    console.error('[QQ Gateway] Failed to connect:', error);
+    throw error;
+  });
 
   return await connectPromise;
 }
@@ -303,10 +434,19 @@ export function getConnectionState(): ConnectionState {
  * 断开连接
  */
 export function disconnect() {
+  // 取消待执行的重连
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
   if (globalConnection.ws) {
     globalConnection.ws.close();
   }
 
   connectPromise = null;
+  savedCredentials = null;
+  savedOnMessage = null;
+  reconnectAttempt = 0;
   resetConnectionState();
 }

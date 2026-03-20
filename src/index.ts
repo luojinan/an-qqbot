@@ -7,11 +7,14 @@ import {
   sendGroupMessage,
 } from './lib/api';
 import { connectToGateway, getConnectionState } from './gateway';
+import { initOpenCodeConfig, sendMessageToLLM } from './lib/opencode';
 
 // 定义环境变量类型
 type Bindings = {
   QQBOT_APP_ID: string;
   QQBOT_CLIENT_SECRET: string;
+  OPENCODE_PROXY_URL: string;
+  OPENCODE_MODEL_ID?: string;
   QQ_BOT_KV?: KVNamespace;
 };
 
@@ -53,6 +56,17 @@ app.post('/connect', async (c) => {
     return c.json({ error: 'Missing QQBOT_APP_ID or QQBOT_CLIENT_SECRET' }, 400);
   }
 
+  // 初始化 OpenCode LLM 配置
+  // 捕获到局部变量，在回调闭包中使用（WebSocket 回调不经过 HTTP 中间件）
+  const openCodeProxyUrl = c.env.OPENCODE_PROXY_URL;
+  const openCodeModelId = c.env.OPENCODE_MODEL_ID;
+  if (openCodeProxyUrl) {
+    initOpenCodeConfig({
+      proxyUrl: openCodeProxyUrl,
+      modelID: openCodeModelId,
+    });
+  }
+
   try {
     // 连接到网关，并处理接收到的消息
     await connectToGateway(appId, clientSecret, async (event) => {
@@ -64,15 +78,26 @@ app.post('/connect', async (c) => {
         if (event.type === 'C2C_MESSAGE_CREATE') {
           const openid = event.data?.author?.user_openid;
           const msgId = event.data?.id;
-          const content = String(event.data?.content ?? '').trim() || '空消息';
+          const content = String(event.data?.content ?? '').trim();
 
           if (!openid || !msgId) {
             console.warn('[Auto Reply] Missing c2c openid or msgId');
             return;
           }
 
-          await sendC2CMessage(token, openid, `收到你的消息：${content}`, msgId);
-          console.log('[Auto Reply] C2C reply sent to:', openid);
+          if (!content) {
+            await sendC2CMessage(token, openid, '请发送文字消息', msgId);
+            return;
+          }
+
+          try {
+            const llmReply = await sendMessageToLLM(openid, content);
+            await sendC2CMessage(token, openid, llmReply, msgId);
+            console.log('[Auto Reply] LLM reply sent to:', openid);
+          } catch (llmErr) {
+            console.error('[Auto Reply] LLM call failed:', llmErr);
+            await sendC2CMessage(token, openid, 'LLM 服务暂时不可用，请稍后再试。', msgId);
+          }
           return;
         }
 
